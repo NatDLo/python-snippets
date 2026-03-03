@@ -1,0 +1,172 @@
+# We create 3 child processes that play rock-paper-scissors and the parent process determines the winner. 
+# If there is a tie between at least 2 players, those 2 players play again. Each child process keeps track 
+# of how many times it has won. The parent process asks via console if they want to play again after each round.
+
+
+import multiprocessing
+import os
+import time
+import random
+
+def child_process(c, child_id):
+    """
+    Child process function. Receives messages from the parent process,
+    makes a random choice of 'Stone', 'Paper', or 'Scissors', and sends
+    the choice back to the parent. Keeps track of wins and responds to
+    'stop' and 'wait' messages from the parent.
+    """
+    options = ['Stone', 'Paper', 'Scissors']
+    wins = 0
+
+    while True:
+        message = c.recv()   # Receive message from parent
+
+        if message == 'stop':
+            print(f'Child Process {child_id} finished with {wins} wins.')
+            break
+
+        if message == 'wait':
+            print(f'Child Process {child_id} is waiting for the next round.')
+            continue
+
+        if message == 'play':
+            choice = random.choice(options)
+            print(f'Child Process {child_id} ({os.getpid()}) chooses: {choice}')
+            c.send((child_id, choice))   # Send message to parent
+
+            result = c.recv()   # Receive result from parent
+            if result == 'You Win':
+                wins += 1
+                print(f'Child Process {child_id} wins this round! Total wins: {wins}')
+            elif result == 'You Lose':
+                print(f'Child Process {child_id} loses this round. Total wins: {wins}')
+            elif result == 'Try again':
+                print(f'Child Process {child_id} is asked to try again.')
+                continue
+
+    c.close()
+
+
+def play_round(active_indexes, parent_conns):
+    """
+    Helper function. Sends 'play' to the active child processes, 
+    receives their choices, and returns a dictionary of {index: choice}.
+    """
+    active_indexes = list(active_indexes)
+
+    for i in range(3):
+        if i in active_indexes:
+            parent_conns[i].send('play')
+        else:
+            parent_conns[i].send('wait')
+
+    choices = {}
+    while len(choices) < len(active_indexes):
+        for i in active_indexes:
+            if i not in choices:
+                child_id, choice = parent_conns[i].recv()
+                choices[i] = choice
+    return choices
+
+
+def parent_process():
+    """
+    Parent process function. Manages the game by communicating with child processes,
+    determining the winner of each round, and handling tie-breaks.
+    """
+    pipes = [multiprocessing.Pipe() for _ in range(3)] # create 3 pipes for communication with 3 child processes
+    parent_conns = [p[0] for p in pipes] # Get the parent ends of the pipes
+    child_conns  = [p[1] for p in pipes] # Get the child ends of the pipes
+
+    children = [
+        multiprocessing.Process(target=child_process, args=(child_conns[i], i + 1))
+        for i in range(3)
+        ] # Create 3 child processes
+
+    for ch in children:
+        ch.start() # Start the child processes
+
+    beats = {'Stone': 'Scissors', 'Paper': 'Stone', 'Scissors': 'Paper'}
+    all_indexes = [0, 1, 2]
+
+    while True:
+        # receive (id, choice) from each child process
+        choices = play_round(all_indexes, parent_conns)
+        vals = list(choices.values()) # Get the choices for each child process
+        
+        print(f'Parent {os.getpid()} receives: '
+              f'Child: (1, {vals[0]}), Child: (2, {vals[1]}), Child: (3, {vals[2]})'
+              )
+        
+        unique = set(vals) # Get unique choices
+
+        # tie of three or all different (in which case it's also a tie)
+        if len(unique) == 1 or len(unique) == 3:
+            print("It's a tie among all players; everyone replays.")
+            for i in all_indexes:
+                parent_conns[i].send('tie')
+            continue
+
+        # 2 vs 1: one wins, or tie of two
+        repeated = next(opt for opt in ['Stone', 'Paper', 'Scissors'] if vals.count(opt) == 2) # Get the choice that was repeated
+        # repeated returns an element
+        repeated_indexes = [i for i in all_indexes if choices[i] == repeated] # Get the indexes of the two players that tied
+        lone_index = [i for i in all_indexes if i not in repeated_indexes][0] # Get the index of the lone player
+        lone_choice = choices[lone_index] # Get the choice of the lone player
+
+        # if the one different beats the repeated, that one wins; otherwise it's a tie of two
+        if beats[lone_choice] == repeated:
+            winners = [lone_index]
+            for i in all_indexes:
+                parent_conns[i].send('You Win' if i in winners else 'You Lose')
+
+        else:
+            # It's a tie of two; those two replay, the lone one loses
+            print("Tie of two; those two replay.")
+            for i in all_indexes:
+                if i in repeated_indexes:
+                    parent_conns[i].send('tie')
+                else:
+                    parent_conns[i].send('You Lose')
+
+            # Tie-break
+            while True:
+                tb_choices = play_round(repeated_indexes, parent_conns)
+                v0 = tb_choices[repeated_indexes[0]]
+                v1 = tb_choices[repeated_indexes[1]]
+                print(f'Tie-break choices: Child{repeated_indexes[0] + 1}: {v0}, '
+                    f'Child{repeated_indexes[1] + 1}: {v1}'
+                    )
+
+                # if its a tie again, repeat; otherwise determine the winner
+                if v0 == v1:
+                    print("Tie-break is a tie again; replaying.")
+                    for i in repeated_indexes:
+                        parent_conns[i].send('tie')
+                    continue
+                
+                if beats[v0] == v1:
+                    winner = repeated_indexes[0]
+                    loser = repeated_indexes[1]
+                else:
+                    winner = repeated_indexes[1]
+                    loser = repeated_indexes[0]
+
+                print(f'Tie-break winner: Child{winner + 1}')
+                parent_conns[winner].send('You Win')
+                parent_conns[loser].send('You Lose')
+                break
+        
+        # Ask if they want to play again
+        keep_playing = input("Do you want to play again? (yes/no): ").strip().lower() == 'yes'
+
+        if not keep_playing:
+            for i in all_indexes:
+                parent_conns[i].send('stop')
+            break
+
+    for ch in children:
+        ch.join() # Wait for all child processes to finish
+
+if __name__ == "__main__":
+    parent_process()
